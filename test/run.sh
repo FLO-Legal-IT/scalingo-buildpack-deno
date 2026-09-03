@@ -23,10 +23,27 @@ setup_build_dir() {
 # is ~40 MB per aanroep. In de container is /tmp toch per run vers; lokaal
 # scheelt het bij herhaald draaien echt.
 run_compile() {
-  local build_dir="${1}"
-  local env_dir
-  env_dir="$(mktemp -d)"
-  "${BP_DIR}/bin/compile" "${build_dir}" "${BUILDPACK_TEST_CACHE}" "${env_dir}" > "${STD_OUT}" 2> "${STD_ERR}"
+  run_compile_with_cache "${1}" "${BUILDPACK_TEST_CACHE}"
+}
+
+# Zelfde aanroep, maar met een zelfgekozen CACHE_DIR: de cachetests hebben een
+# map nodig waarvan ze de begintoestand kennen.
+run_compile_with_cache() {
+  local build_dir="${1}" cache_dir="${2}"
+  local env_dir="${3:-}"
+  [[ -n "${env_dir}" ]] || env_dir="$(mktemp -d)"
+  "${BP_DIR}/bin/compile" "${build_dir}" "${cache_dir}" "${env_dir}" > "${STD_OUT}" 2> "${STD_ERR}"
+}
+
+# Een verse CACHE_DIR, maar mét de al gedownloade runtime-binary uit de
+# gedeelde testcache: de dependencycache begint zo gegarandeerd leeg zonder dat
+# de test 40 MB opnieuw ophaalt. De binary heet deno-vX.Y.Z, de dependencycache
+# deno-deps — de glob pakt dus alleen de binary.
+fresh_cache_dir() {
+  local dir
+  dir="$(mktemp -d)"
+  cp -a "${BUILDPACK_TEST_CACHE}"/deno-v* "${dir}/" 2> /dev/null || true
+  echo "${dir}"
 }
 
 # Slaat de aanroepende test zichtbaar over op omgevingen zonder unzip (de
@@ -220,6 +237,67 @@ test_compile_warns_without_lockfile() {
   run_compile "${dir}"
   assertEquals "ontbrekende lockfile is een waarschuwing, geen fout" 0 $?
   assertFileContains "deno.lock" "${STD_OUT}"
+}
+
+# --- dependencycache ------------------------------------------------------
+
+test_compile_reuses_dependency_cache_between_builds() {
+  require_unzip || return 0
+  local cache dir1 dir2
+  cache="$(fresh_cache_dir)"
+
+  dir1="$(setup_build_dir minimal)"
+  run_compile_with_cache "${dir1}" "${cache}"
+  assertEquals "eerste build moet slagen" 0 $?
+  assertFileContains "dependency-cache: leeg" "${STD_OUT}"
+  assertTrue "de eerste build moet de cache bewaren" \
+    "[ -f '${cache}/deno-deps.signature' ]"
+
+  # Merkbestand in de bewaarde cache: duikt het in de tweede build op in
+  # DENO_DIR, dan is die map er echt uit teruggezet.
+  echo marker > "${cache}/deno-deps/marker"
+
+  dir2="$(setup_build_dir minimal)"
+  run_compile_with_cache "${dir2}" "${cache}"
+  assertEquals "tweede build moet slagen" 0 $?
+  assertTrue "de bewaarde cache moet in DENO_DIR terugkomen" \
+    "[ -f '${dir2}/.scalingo/deno-cache/marker' ]"
+  assertFileContains "teruggezet" "${STD_OUT}"
+}
+
+test_compile_discards_dependency_cache_with_other_signature() {
+  require_unzip || return 0
+  local cache dir
+  cache="$(fresh_cache_dir)"
+  mkdir -p "${cache}/deno-deps"
+  echo marker > "${cache}/deno-deps/marker"
+  echo "format=1 deno=v0.0.0 stack=verzonnen" > "${cache}/deno-deps.signature"
+
+  dir="$(setup_build_dir minimal)"
+  run_compile_with_cache "${dir}" "${cache}"
+  assertEquals "compile moet slagen" 0 $?
+  assertFalse "een cache van een andere signature mag niet teruggezet worden" \
+    "[ -f '${dir}/.scalingo/deno-cache/marker' ]"
+  assertFileContains "vervallen" "${STD_OUT}"
+}
+
+test_compile_env_var_disables_and_clears_dependency_cache() {
+  require_unzip || return 0
+  local cache dir env_dir
+  cache="$(fresh_cache_dir)"
+  mkdir -p "${cache}/deno-deps"
+  echo marker > "${cache}/deno-deps/marker"
+  env_dir="$(mktemp -d)"
+  printf 'false' > "${env_dir}/DENO_DEPS_CACHE"
+
+  dir="$(setup_build_dir minimal)"
+  run_compile_with_cache "${dir}" "${cache}" "${env_dir}"
+  assertEquals "compile moet slagen" 0 $?
+  assertFalse "met de cache uit mag er niets teruggezet worden" \
+    "[ -f '${dir}/.scalingo/deno-cache/marker' ]"
+  assertFalse "en de bewaarde cache hoort opgeruimd te zijn" \
+    "[ -d '${cache}/deno-deps' ]"
+  assertFileContains "uitgeschakeld" "${STD_OUT}"
 }
 
 # --- runtime-omgeving na de verhuizing naar /app --------------------------

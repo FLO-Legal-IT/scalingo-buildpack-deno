@@ -23,12 +23,14 @@ release-tarball op eigen hosting kan ook.
 | `deno.lock` | aanbevolen | `deno install --frozen` |
 | `.deno-version` | nee | Pint de runtime; zonder geldt de default van de buildpack |
 
-Twee env-vars sturen de build:
+Vier env-vars sturen de build:
 
 | Variabele | Betekenis |
 |---|---|
 | `DENO_VERSION` | Runtime-versie, alléén gelezen als `.deno-version` ontbreekt; zelfde `vX.Y.Z`-eis |
 | `DENO_BUILD_TASK` | Naam van de buildtask (default `build`); draait alleen als hij in `deno.json` bestaat |
+| `DENO_DEPS_CACHE` | Op `false` zet de dependencycache uit én ruimt de bewaarde cache op |
+| `DENO_DEPS_CACHE_MAX_MB` | Verhoogt de grens waarboven de cache vervalt (default 512) |
 
 `Procfile`:
 
@@ -42,6 +44,31 @@ Deno.serve({
   hostname: "0.0.0.0",
 }, handler);
 ```
+
+## Caching
+
+Twee dingen overleven een build: de Deno-runtime en de dependencies. Allebei
+staan ze in de buildcache van het platform, en allebei komen ze bij de volgende
+deploy terug zonder download. `DENO_DIR` staat tijdens de build onder
+`BUILD_DIR`, want alleen wat daar staat reist mee de slug in — je app hoeft bij
+het booten dus nooit iets op te halen — en de buildpack kopieert die map heen en
+weer naar de buildcache, want alleen díé overleeft de build.
+
+De cachesleutel is de Deno-versie plus de stack. Verandert er één van, dan
+vervalt de hele cache. De lockfile zit er bewust **niet** in: juist bij een
+gewijzigde lock is de oude cache het meest waard, omdat verreweg de meeste
+packages hetzelfde blijven. Wat er niet meer bij hoort blijft dan als dood
+gewicht achter; boven de 512 MB wordt de cache in zijn geheel weggegooid, want
+vanaf enige omvang kosten de twee kopieerslagen meer dan de downloads die ze
+besparen. Is jouw `DENO_DIR` legitiem groter, verhoog dan
+`DENO_DEPS_CACHE_MAX_MB`.
+
+Loopt er iets mis met de cache, of wil je één keer schoon bouwen:
+
+    scalingo -a app-naam env-set DENO_DEPS_CACHE=false
+
+Die deploy ruimt de bewaarde cache op. Zet de variabele daarna weer terug
+(`env-unset`), anders bouw je voortaan elke keer koud.
 
 ## App-specifieke initialisatie
 
@@ -76,7 +103,7 @@ uitgepakte binary — en allebei worden ze gecontroleerd.
 
 **Eén alles-of-niets cachesleutel**, geen gedeeltelijke invalidatie. De vier
 buildpaden in de Node-buildpack komen voort uit pogingen de cache slim te
-repareren. Die complexiteit erven we niet.
+repareren. Die complexiteit erven we niet: een cache klopt of hij vervalt.
 
 ## Tests
 

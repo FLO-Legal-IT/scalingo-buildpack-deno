@@ -14,6 +14,16 @@ source "${BP_DIR}/lib/failure.sh"
 source "${BP_DIR}/lib/version.sh"
 # shellcheck source=lib/deno.sh
 source "${BP_DIR}/lib/deno.sh"
+# shellcheck source=lib/cache.sh
+source "${BP_DIR}/lib/cache.sh"
+
+# Leest een env-var zoals het platform hem aanlevert: één bestand per variabele
+# in ENV_DIR, met de waarde als inhoud. Geeft een lege string als hij ontbreekt.
+env_var() {
+  local name="${1}"
+  [[ -n "${ENV_DIR}" && -f "${ENV_DIR}/${name}" ]] || return 0
+  tr -d '[:space:]' < "${ENV_DIR}/${name}"
+}
 
 if [[ -z "${BUILD_DIR}" || ! -d "${BUILD_DIR}" ]]; then
   echo "usage: compile BUILD_DIR CACHE_DIR ENV_DIR" >&2
@@ -21,6 +31,9 @@ if [[ -z "${BUILD_DIR}" || ! -d "${BUILD_DIR}" ]]; then
 fi
 
 mkdir -p "${CACHE_DIR}"
+# Absoluut maken: verderop wordt er naar BUILD_DIR gecd'd, en een relatief
+# CACHE_DIR zou daarna een andere map aanwijzen dan bedoeld.
+CACHE_DIR="$(cd "${CACHE_DIR}" && pwd)"
 
 output::header "Deno"
 
@@ -61,6 +74,30 @@ export DENO_NO_UPDATE_CHECK=1
 
 cd "${BUILD_DIR}"
 
+# De dependencycache: standaard aan, uit te zetten met DENO_DEPS_CACHE=false —
+# dat ruimt meteen ook de bewaarde cache op, zodat een deploy met die vlag de
+# manier is om met een schone lei te beginnen.
+deps_cache="on"
+case "$(env_var DENO_DEPS_CACHE | tr '[:upper:]' '[:lower:]')" in
+  false | 0 | off | no | disabled) deps_cache="off" ;;
+esac
+
+# De limiet uit lib/cache.sh is een vangnet, geen wet: een project met een
+# legitiem grote DENO_DIR moet hem kunnen ophogen zonder de buildpack te forken.
+deps_cache_max_mb="$(env_var DENO_DEPS_CACHE_MAX_MB)"
+if [[ "${deps_cache_max_mb}" =~ ^[0-9]+$ ]]; then
+  CACHE_MAX_MB="${deps_cache_max_mb}"
+fi
+
+DEPS_CACHE_SIGNATURE="$(cache::signature "${DENO_VERSION_RESOLVED}" "${STACK:-onbekend}")"
+
+if [[ "${deps_cache}" == "on" ]]; then
+  cache::restore "${CACHE_DIR}" "${DENO_RUNTIME_CACHE}" "${DEPS_CACHE_SIGNATURE}"
+else
+  output::info "dependency-cache: uitgeschakeld (DENO_DEPS_CACHE), bewaarde cache verwijderd"
+  cache::clear "${CACHE_DIR}"
+fi
+
 if [[ -f deno.lock ]]; then
   output::monitor "dependencies (deno install --frozen)" deno install --frozen \
     || failure::frozen_lockfile
@@ -73,10 +110,8 @@ fi
 # takenlijst vangen en dan pas grep: een directe pipe naar grep -q zou onder
 # pipefail kunnen struikelen over de SIGPIPE die grep veroorzaakt zodra hij
 # zijn match heeft.
-build_task="build"
-if [[ -n "${ENV_DIR}" && -f "${ENV_DIR}/DENO_BUILD_TASK" ]]; then
-  build_task="$(tr -d '[:space:]' < "${ENV_DIR}/DENO_BUILD_TASK")"
-fi
+build_task="$(env_var DENO_BUILD_TASK)"
+build_task="${build_task:-build}"
 # NO_COLOR: deno task kleurt zijn uitvoer óók wanneer die gepipet wordt, en
 # de escapecodes zouden tussen "- " en de taaknaam belanden — de grep hieronder
 # zou de task dan stil missen en de buildstap overslaan.
@@ -85,6 +120,12 @@ if grep -qE "^-[[:space:]]*${build_task}([[:space:]]|$)" <<< "${task_list}"; the
   output::monitor "deno task ${build_task}" deno task "${build_task}"
 else
   output::info "geen '${build_task}'-task in deno.json; buildstap overgeslagen"
+fi
+
+# Ná de buildtask, niet ervoor: die vult DENO_DIR met de compilatiecache van de
+# eigen broncode, en ook die hoeft de volgende build dan niet opnieuw te maken.
+if [[ "${deps_cache}" == "on" ]]; then
+  cache::save "${CACHE_DIR}" "${DENO_RUNTIME_CACHE}" "${DEPS_CACHE_SIGNATURE}"
 fi
 
 # Voor volgende buildpacks in een keten: die sourcen het export-bestand van hun
