@@ -1,0 +1,8 @@
+.deno-version-cache/
+*.tmp
+.idea
+
+# Door bin/compile geschreven voor volgende buildpacks in een keten; een
+# build-artefact, geen bron. Ontstaat ook bij een lokale testrun (daar is de
+# buildpack-map schrijfbaar).
+export

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUILD_DIR="${1:-}"
+CACHE_DIR="${2:-}"
+ENV_DIR="${3:-}"
+BP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# shellcheck source=lib/output.sh
+source "${BP_DIR}/lib/output.sh"
+# shellcheck source=lib/failure.sh
+source "${BP_DIR}/lib/failure.sh"
+# shellcheck source=lib/version.sh
+source "${BP_DIR}/lib/version.sh"
+# shellcheck source=lib/deno.sh
+source "${BP_DIR}/lib/deno.sh"
+
+if [[ -z "${BUILD_DIR}" || ! -d "${BUILD_DIR}" ]]; then
+  echo "usage: compile BUILD_DIR CACHE_DIR ENV_DIR" >&2
+  exit 1
+fi
+
+mkdir -p "${CACHE_DIR}"
+
+output::header "Deno"
+
+failure::dot_scalingo_checked_in "${BUILD_DIR}"
+failure::missing_procfile "${BUILD_DIR}"
+
+if [[ ! -f "${BUILD_DIR}/deno.lock" ]]; then
+  output::warn "Geen deno.lock gevonden.
+
+Zonder lockfile zijn je builds niet reproduceerbaar: een dependency kan
+tussen twee deploys van inhoud veranderen. Draai lokaal:
+
+    deno install
+
+en commit het gegenereerde deno.lock."
+fi
+
+version::determine "${BUILD_DIR}" "${ENV_DIR}"
+
+# Deze ene regel beantwoordt bij een echte deploy meteen het open punt uit de
+# README: op welk stack-image draait een build eigenlijk, en heeft dat unzip?
+output::info "Versie: ${DENO_VERSION_RESOLVED} | stack: ${STACK:-onbekend} | unzip: $(command -v unzip || echo 'ontbreekt')"
+
+DENO_INSTALL_DIR="${BUILD_DIR}/.scalingo/deno"
+DENO_RUNTIME_CACHE="${BUILD_DIR}/.scalingo/deno-cache"
+mkdir -p "${DENO_INSTALL_DIR}/bin" "${DENO_RUNTIME_CACHE}"
+
+output::monitor "runtime-installatie" \
+  deno::install "${DENO_VERSION_RESOLVED}" "${DENO_INSTALL_DIR}" "${CACHE_DIR}"
+
+# Voor de rest van deze build (deps, buildtask) én — via het export-bestand
+# onderaan — voor volgende buildpacks in een multi-buildpackketen.
+export PATH="${DENO_INSTALL_DIR}/bin:${PATH}"
+# DENO_DIR binnen BUILD_DIR: zo reizen de dependencies mee de slug in en hoeft
+# de app ze bij het booten niet opnieuw op te halen.
+export DENO_DIR="${DENO_RUNTIME_CACHE}"
+export DENO_NO_UPDATE_CHECK=1
+
+cd "${BUILD_DIR}"
+
+if [[ -f deno.lock ]]; then
+  output::monitor "dependencies (deno install --frozen)" deno install --frozen \
+    || failure::frozen_lockfile
+else
+  output::monitor "dependencies (deno install)" deno install
+fi
+
+# Optionele buildstap: draait de task (default "build", overschrijfbaar via de
+# env var DENO_BUILD_TASK) alléén als hij in deno.json bestaat. Eerst de
+# takenlijst vangen en dan pas grep: een directe pipe naar grep -q zou onder
+# pipefail kunnen struikelen over de SIGPIPE die grep veroorzaakt zodra hij
+# zijn match heeft.
+build_task="build"
+if [[ -n "${ENV_DIR}" && -f "${ENV_DIR}/DENO_BUILD_TASK" ]]; then
+  build_task="$(tr -d '[:space:]' < "${ENV_DIR}/DENO_BUILD_TASK")"
+fi
+# NO_COLOR: deno task kleurt zijn uitvoer óók wanneer die gepipet wordt, en
+# de escapecodes zouden tussen "- " en de taaknaam belanden — de grep hieronder
+# zou de task dan stil missen en de buildstap overslaan.
+task_list="$(NO_COLOR=1 deno task 2> /dev/null || true)"
+if grep -qE "^-[[:space:]]*${build_task}([[:space:]]|$)" <<< "${task_list}"; then
+  output::monitor "deno task ${build_task}" deno task "${build_task}"
+else
+  output::info "geen '${build_task}'-task in deno.json; buildstap overgeslagen"
+fi
+
+# Voor volgende buildpacks in een keten: die sourcen het export-bestand van hun
+# voorgangers. Alleen als de buildpack-map schrijfbaar is — in de testharnas is
+# hij bewust read-only gemount.
+if [[ -w "${BP_DIR}" ]]; then
+  cat > "${BP_DIR}/export" <<EXPORT
+export PATH="${DENO_INSTALL_DIR}/bin:\${PATH}"
+export DENO_DIR="${DENO_RUNTIME_CACHE}"
+export DENO_NO_UPDATE_CHECK=1
+EXPORT
+fi
+
+mkdir -p "${BUILD_DIR}/.profile.d"
+
+cat > "${BUILD_DIR}/.profile.d/deno.sh" <<'PROFILE'
+export PATH="/app/.scalingo/deno/bin:${PATH}"
+export DENO_DIR="/app/.scalingo/deno-cache"
+export DENO_NO_UPDATE_CHECK=1
+PROFILE
+
+output::info "klaar"

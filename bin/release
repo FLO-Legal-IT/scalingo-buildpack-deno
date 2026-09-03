@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Bewust geen default_process_types: een ontbrekende Procfile hoort een
+# expliciete fout te geven in bin/compile, geen stilzwijgende gok.
+#
+# PATH staat hier expliciet in, ook al zet .profile.d/deno.sh hem ook. Het
+# release-voorbeeld in de Scalingo-documentatie geeft eveneens een volledige
+# PATH mee in config_vars. Of config_vars de standaard-PATH aanvult of
+# vervangt is niet gedocumenteerd; door de gedocumenteerde standaardwaarde
+# volledig mee te geven is beide gedrag veilig.
+
+cat <<YAML
+---
+config_vars:
+  PATH: /app/.scalingo/deno/bin:/app/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  DENO_NO_UPDATE_CHECK: "1"
+YAML
